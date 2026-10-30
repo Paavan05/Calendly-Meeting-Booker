@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { --bg:#262730; --fg:#fafafa; --accent:#ff4b4b; --muted:#9aa0ae; --lvl:0; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; background:transparent; color:var(--fg);
+    font-family:"Source Sans Pro", system-ui, -apple-system, "Segoe UI", sans-serif; overflow:hidden; }
+  #bar { display:flex; align-items:center; gap:6px; height:100%; padding:0 10px 0 20px;
+    background:var(--bg); border:1px solid rgba(128,128,128,.3); border-radius:16px; }
+  #txt { flex:1 1 auto; min-width:0; height:100%; border:0; outline:0; background:transparent;
+    color:var(--fg); font:inherit; font-size:16px; }
+  #txt::placeholder { color:var(--muted); opacity:1; }
+  button { flex:0 0 auto; width:40px; height:40px; padding:0; border:0; background:none; color:inherit;
+    display:flex; align-items:center; justify-content:center; cursor:pointer; position:relative; font:inherit; }
+  #mic { border-radius:50%; color:var(--muted); transition:background .15s, color .15s; }
+  #mic:hover { background:rgba(128,128,128,.2); color:var(--fg); }
+  #bar[data-active="1"] #mic, #bar[data-active="1"] #mic:hover { background:var(--accent); color:#fff; }
+  #mic::after { content:""; position:absolute; inset:-3px; border-radius:50%; border:2px solid var(--accent);
+    opacity:0; pointer-events:none; }
+  #bar[data-active="1"][data-state="listening"] #mic::after { animation:breathe 1.8s ease-in-out infinite; }
+  #bar[data-state="recording"] #mic::after { opacity:.85; transform:scale(calc(1 + var(--lvl) * .35));
+    transition:transform .08s linear; }
+  @keyframes breathe { 0%,100% { opacity:.15; transform:scale(1); } 50% { opacity:.7; transform:scale(1.18); } }
+  #send { border-radius:10px; color:var(--muted); transition:background .15s, color .15s; }
+  #send:not(:disabled) { background:var(--accent); color:#fff; }
+  #send:disabled { opacity:.45; cursor:default; }
+</style>
+</head>
+<body>
+  <div id="bar" data-state="idle" data-active="0">
+    <input id="txt" type="text" autocomplete="off" spellcheck="false" enterkeyhint="send" placeholder="Type your message" />
+    <button id="mic" type="button" title="Speak" aria-label="Speak">
+      <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
+    </button>
+    <button id="send" type="button" title="Send" aria-label="Send" disabled>
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/></svg>
+    </button>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------- tunables ----------
+  var SILENCE_MS = 1400;            // silence that ends your sentence
+  var MAX_UTTERANCE_MS = 27000;     // hard cap per recording (Sarvam REST limit is ~30 s)
+  var MIN_VOICED_MS = 200;          // ignore blips shorter than this
+  var IDLE_AFTER_MS = 30000;        // no speech for this long -> mic turns off
+  var RESUME_DELAY_MS = 450;        // wait after the app stops talking (avoids echo)
+  var PROCESSING_TIMEOUT_MS = 60000;
+  var TARGET_SR = 16000;
+  var PRE_FRAMES = 5;               // audio kept from just before you start talking
+  var MIN_ON = 0.015, MIN_OFF = 0.01;   // loudness thresholds: raise MIN_ON if background noise triggers it
+
+  var $ = function (id) { return document.getElementById(id); };
+  var bar = $("bar"), txt = $("txt"), mic = $("mic"), send = $("send");
+
+  // ---------- Streamlit protocol ----------
+  function post(type, extra) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, extra || {}), "*");
+  }
+  function sendValue(v) { post("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+  function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+
+  // ---------- state ----------
+  var PH = { idle: "Type your message", waiting: "Listening", listening: "Listening",
+             recording: "Listening", speaking: "Speaking", processing: "Working on it" };
+  var state = "idle";               // idle | waiting | listening | recording | speaking | processing
+  var session = false;              // true after you tapped the mic: keep listening between replies
+  var starting = false, inited = false;
+  var stream = null, ctx = null, source = null, proc = null, rate = 48000;
+  var capturing = false;
+  var audioEl = null, finalSpeech = false;
+  var lastSpeakId = null, lastTick = null, pendingId = null;
+  var procTimer = null, resumeTimer = null, noteTimer = null;
+  var noise = 0.006;
+  var pre = [], chunks = [], inSpeech = false, loud = 0, voicedMs = 0, utterStart = 0, lastVoice = 0, listenStart = 0;
+
+  function updateControls() {
+    bar.setAttribute("data-active", session ? "1" : "0");
+    send.disabled = !!pendingId || !txt.value.trim();
+    var t = !session ? "Speak"
+          : state === "recording" ? "Send now"
+          : state === "speaking" ? "Skip and talk"
+          : "Stop listening";
+    mic.title = t; mic.setAttribute("aria-label", t);
+  }
+  function setState(s, note) {
+    state = s;
+    bar.setAttribute("data-state", s);
+    mic.style.setProperty("--lvl", "0");
+    clearTimeout(noteTimer);
+    txt.placeholder = note || PH[s];
+    if (note) noteTimer = setTimeout(function () { if (state === "idle") txt.placeholder = PH.idle; }, 6000);
+    updateControls();
+  }
+
+  // ---------- page integration ----------
+  function markFrame() {
+    try { if (window.frameElement) window.frameElement.setAttribute("data-voice-bar", "1"); } catch (e) {}
+  }
+  function applyTheme(t) {
+    if (!t) return;
+    var r = document.documentElement.style;
+    if (t.secondaryBackgroundColor) r.setProperty("--bg", t.secondaryBackgroundColor);
+    if (t.textColor) r.setProperty("--fg", t.textColor);
+    if (t.primaryColor) r.setProperty("--accent", t.primaryColor);
+  }
+  function scrollToBottom() {
+    try {
+      var d = window.parent.document;
+      var m = d.querySelector('[data-testid="stMain"]') || d.querySelector("section.main") || d.scrollingElement;
+      if (m) m.scrollTo({ top: m.scrollHeight, behavior: "smooth" });
+    } catch (e) {}
+  }
+
+  // ---------- microphone ----------
+  function releaseMic() {
+    capturing = false;
+    try { if (proc) { proc.onaudioprocess = null; proc.disconnect(); } } catch (e) {}
+    try { if (source) source.disconnect(); } catch (e) {}
+    try { if (stream) stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    try { if (ctx && ctx.state !== "closed") ctx.close(); } catch (e) {}
+    proc = source = stream = ctx = null;
+  }
+
+  function ensureMic() {
+    if (stream && stream.active && ctx && ctx.state !== "closed") {
+      return ctx.resume ? ctx.resume() : Promise.resolve();
+    }
+    releaseMic();
+    return Promise.resolve().then(function () {
+      return navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+    }).then(function (s) {
+      stream = s;
+      var AC = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC();
+      rate = ctx.sampleRate;
+      source = ctx.createMediaStreamSource(stream);
+      proc = ctx.createScriptProcessor(4096, 1, 1);
+      proc.onaudioprocess = onAudio;
+      source.connect(proc);
+      proc.connect(ctx.destination);
+      return ctx.resume ? ctx.resume() : null;
+    });
+  }
+
+  function micFailed(e) {
+    var n = (e && e.name) || "error";
+    goIdle("Microphone unavailable (" + n + "). You can type instead.");
+  }
+
+  // ---------- session control ----------
+  function cancelCapture() { capturing = false; inSpeech = false; chunks = []; pre = []; loud = 0; voicedMs = 0; }
+
+  function endSession() {
+    clearTimeout(resumeTimer);
+    session = false; finalSpeech = false; starting = false;
+    cancelCapture(); releaseMic();
+    updateControls();
+  }
+  function goIdle(note) {
+    clearTimeout(procTimer);
+    endSession();
+    pendingId = null;
+    setState("idle", note);
+  }
+
+  function startSession() {
+    stopSpeech(); clearTimeout(resumeTimer);
+    txt.value = ""; txt.blur();
+    session = true; finalSpeech = false;
+    setState("waiting");
+    startListening();
+  }
+
+  function startListening() {
+    if (!session || starting) return;
+    if (state === "listening" || state === "recording" || state === "speaking" || state === "processing") return;
+    starting = true;
+    ensureMic().then(function () {
+      starting = false;
+      if (!session) { releaseMic(); return; }
+      if (state === "speaking" || state === "processing") return;
+      cancelCapture();
+      capturing = true;
+      listenStart = performance.now();
+      setState("listening");
+    }).catch(function (e) { starting = false; micFailed(e); });
+  }
+
+  function onAudio(e) {
+    if (!capturing || !ctx) return;
+    var frame = new Float32Array(e.inputBuffer.getChannelData(0));
+    var frameMs = frame.length / rate * 1000;
+    var sum = 0; for (var i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+    var rms = Math.sqrt(sum / frame.length);
+    var now = performance.now();
+    var onT = Math.max(MIN_ON, noise * 3.5), offT = Math.max(MIN_OFF, noise * 2);
+    if (state === "recording") mic.style.setProperty("--lvl", Math.min(1, rms * 9).toFixed(2));
+
+    if (!inSpeech) {
+      if (rms < onT) { noise = noise * 0.95 + rms * 0.05; loud = 0; } else { loud++; }
+      pre.push(frame); if (pre.length > PRE_FRAMES) pre.shift();
+      if (loud >= 2) {
+        inSpeech = true; utterStart = now; lastVoice = now; voicedMs = loud * frameMs;
+        chunks = pre.slice(); pre = [];
+        setState("recording");
+      } else if (now - listenStart > IDLE_AFTER_MS) {
+        goIdle("No speech heard. Tap the mic to talk again.");
+      }
+    } else {
+      chunks.push(frame);
+      if (rms > offT) { lastVoice = now; voicedMs += frameMs; }
+      if (now - lastVoice > SILENCE_MS || now - utterStart > MAX_UTTERANCE_MS) finishUtterance();
+    }
+  }
+
+  // ---------- sending what you said ----------
+  function downsample(buf, inRate, outRate) {
+    if (outRate >= inRate) return buf;
+    var ratio = inRate / outRate, outLen = Math.floor(buf.length / ratio), out = new Float32Array(outLen);
+    for (var i = 0; i < outLen; i++) {
+      var s = Math.floor(i * ratio), e = Math.min(Math.floor((i + 1) * ratio), buf.length), acc = 0, n = 0;
+      for (var j = s; j < e; j++) { acc += buf[j]; n++; }
+      out[i] = n ? acc / n : 0;
+    }
+    return out;
+  }
+  function floatToWav(f32, sr) {
+    var buffer = new ArrayBuffer(44 + f32.length * 2), v = new DataView(buffer);
+    function w(o, s) { for (var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); }
+    w(0, "RIFF"); v.setUint32(4, 36 + f32.length * 2, true); w(8, "WAVE"); w(12, "fmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, "data"); v.setUint32(40, f32.length * 2, true);
+    var o = 44;
+    for (var i = 0; i < f32.length; i++) {
+      var s = Math.max(-1, Math.min(1, f32[i]));
+      v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true); o += 2;
+    }
+    return buffer;
+  }
+  function toBase64(buf) {
+    var bytes = new Uint8Array(buf), s = "", CH = 0x8000;
+    for (var i = 0; i < bytes.length; i += CH) s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    return btoa(s);
+  }
+
+  function armTimeout() {
+    clearTimeout(procTimer);
+    procTimer = setTimeout(function () { if (pendingId) afterTurn(); }, PROCESSING_TIMEOUT_MS);
+  }
+
+  function finishUtterance() {
+    if (!inSpeech) return;
+    var frames = chunks, voiced = voicedMs, sr = rate;
+    cancelCapture();
+    if (voiced < MIN_VOICED_MS) {            // a click or cough, not speech
+      setState("waiting");
+      clearTimeout(resumeTimer);
+      resumeTimer = setTimeout(startListening, 150);
+      return;
+    }
+    var total = 0; frames.forEach(function (f) { total += f.length; });
+    var merged = new Float32Array(total), off = 0;
+    frames.forEach(function (f) { merged.set(f, off); off += f.length; });
+    var wav = floatToWav(downsample(merged, sr, TARGET_SR), Math.min(sr, TARGET_SR));
+    pendingId = uid();
+    setState("processing");
+    sendValue({ event: "audio", id: pendingId, b64: toBase64(wav), ms: Math.round(total / sr * 1000) });
+    armTimeout();
+  }
+
+  // ---------- typing ----------
+  function sendText() {
+    var t = txt.value.trim();
+    if (!t || pendingId) return;
+    stopSpeech(); endSession();
+    txt.value = "";
+    pendingId = uid();
+    setState("processing");
+    sendValue({ event: "text", id: pendingId, text: t });
+    armTimeout();
+  }
+  txt.addEventListener("input", updateControls);
+  txt.addEventListener("focus", function () {
+    if (session) {                           // typing and the open mic must never run together
+      stopSpeech(); endSession();
+      if (!pendingId) setState("idle");
+    }
+  });
+  txt.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendText(); }
+  });
+  send.addEventListener("click", sendText);
+
+  // ---------- speaking ----------
+  function stopSpeech() {
+    if (audioEl) { var a = audioEl; audioEl = null; try { a.pause(); } catch (e) {} }
+  }
+  function play(sp) {
+    cancelCapture();
+    clearTimeout(resumeTimer); clearTimeout(procTimer);
+    stopSpeech();
+    pendingId = null;
+    finalSpeech = !!sp.final;
+    if (!sp.audio) { afterTurn(); return; }
+    setState("speaking");
+    var a = new Audio("data:audio/wav;base64," + sp.audio);
+    audioEl = a;
+    function done() { if (audioEl === a) { audioEl = null; afterTurn(); } }
+    a.onended = done; a.onerror = done;
+    var p = a.play();
+    if (p && p.catch) p.catch(function () {
+      if (audioEl !== a) return;
+      audioEl = null;
+      var keepListening = session && !finalSpeech;
+      afterTurn();
+      if (!keepListening) setState("idle", "The browser blocked the sound. Click the page once and try again.");
+    });
+  }
+
+  function afterTurn() {
+    clearTimeout(procTimer); clearTimeout(resumeTimer);
+    pendingId = null;
+    if (session && !finalSpeech) {
+      setState("waiting");
+      resumeTimer = setTimeout(startListening, RESUME_DELAY_MS);
+    } else {
+      goIdle();
+    }
+  }
+
+  // ---------- mic button ----------
+  mic.addEventListener("click", function () {
+    if (pendingId) return;                                   // busy
+    if (!session) { startSession(); return; }
+    if (state === "recording") { finishUtterance(); return; }   // send what you said now
+    if (state === "speaking") { stopSpeech(); afterTurn(); return; }   // skip the reply
+    goIdle();                                                // listening -> mic off
+  });
+
+  // ---------- messages from Python ----------
+  function onRender(ev) {
+    var d = ev.data || {}, args = d.args || {};
+    applyTheme(d.theme);
+    if (!inited) { inited = true; markFrame(); }
+    if (args.tick !== undefined && args.tick !== lastTick) { lastTick = args.tick; setTimeout(scrollToBottom, 250); }
+    var sp = args.speak;
+    if (sp && sp.id && sp.id !== lastSpeakId) { lastSpeakId = sp.id; play(sp); return; }
+    // nothing to say for this turn: carry on (listen again, or go idle)
+    if (pendingId && args.ack && args.ack === pendingId) afterTurn();
+  }
+
+  window.addEventListener("message", function (ev) {
+    if (ev.data && ev.data.type === "streamlit:render") onRender(ev);
+  });
+  window.addEventListener("pagehide", releaseMic);
+
+  post("streamlit:componentReady", { apiVersion: 1 });
+  post("streamlit:setFrameHeight", { height: 60 });
+  markFrame();
+  setState("idle");
+})();
+</script>
+</body>
+</html>
